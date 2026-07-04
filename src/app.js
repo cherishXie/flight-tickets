@@ -8,8 +8,17 @@ import {
   splitList
 } from "./domain.js";
 import { parseBackup, pruneSnapshotsByTask, removeTaskData, serializeBackup, serializeCsv } from "./storage.js";
-import { collectPriceSnapshots, listPriceSources, PRICE_SOURCE_TYPES } from "./priceSources.js";
+import {
+  collectLivePriceSnapshots,
+  collectPriceSnapshots,
+  getLivePriceSourceStatus,
+  listPriceSources,
+  PRICE_SOURCE_TYPES
+} from "./priceSources.js";
 import { buildEmailDraft, buildEmlDataHref, buildMailtoLink, listNotificationChannels } from "./notifications.js";
+import { buildExternalSearchLinks } from "./externalSearchLinks.js";
+import { MANUAL_SOURCE_OPTIONS, manualSourceOptionByProvider } from "./priceSourceCatalog.js";
+import { alertRulesFromSettings as buildAlertRulesFromSettings, canSendAlert as canSendAlertForSeries, createAlertLog as buildAlertLog } from "./alerting.js";
 import {
   buildRecommendationScore,
   DEFAULT_ALERT_RULES,
@@ -28,6 +37,9 @@ const defaultSettings = {
   defaultCurrency: "CNY",
   autoCollectEnabled: false,
   autoCollectIntervalMinutes: 60,
+  priceSourceType: PRICE_SOURCE_TYPES.MOCK,
+  livePriceMaxOffersPerSearch: 8,
+  livePriceMaxQueriesPerRun: 24,
   autoPruneSnapshots: true,
   maxSnapshotsPerTask: 600,
   lastAutoRunAt: null,
@@ -64,6 +76,8 @@ const defaultState = {
   backupText: "",
   backupMessage: "",
   maintenanceMessage: "",
+  collectionMessage: "",
+  liveSourceStatus: null,
   csvImportText: "",
   csvImportMessage: "",
   manualDraft: null,
@@ -76,7 +90,8 @@ const defaultState = {
   snapshotFilters: {
     destinationId: "all",
     strategyType: "all",
-    datePair: "all"
+    datePair: "all",
+    sourceCategory: "all"
   },
   destinationFilters: {
     region: "all",
@@ -107,6 +122,8 @@ function loadState() {
       backupText: "",
       backupMessage: "",
       maintenanceMessage: "",
+      collectionMessage: "",
+      liveSourceStatus: null,
       csvImportText: "",
       csvImportMessage: "",
       manualDraft: null,
@@ -166,7 +183,8 @@ function render() {
           </div>
           <div class="topbar-actions">
             <span class="profile-pill">${escapeHtml(profile.displayName)} · ${escapeHtml(profile.originCity)}</span>
-            <button class="ghost-button" data-action="simulate-all">模拟采集价格</button>
+            ${renderTopbarPriceSourceBadge()}
+            <button class="ghost-button" data-action="simulate-all">${state.settings.priceSourceType === PRICE_SOURCE_TYPES.AMADEUS ? "采集真实价格" : "模拟采集价格"}</button>
             <button class="ghost-button" data-action="toggle-auto">${state.settings.autoCollectEnabled ? "停止自动采集" : "启动自动采集"}</button>
             <button class="primary-button" data-action="open-manual">手动创建</button>
           </div>
@@ -213,10 +231,29 @@ function summaryStrip() {
       ${metric("旅客档案", profile.displayName, `${profile.originCity} · ${profile.originAirportCodes.join(" / ")}`)}
       ${metric("启用任务", activeTasks, "本地保存")}
       ${metric("当前最低", bestSnapshot ? formatMoney(bestSnapshot.priceAmount, bestSnapshot.priceCurrency) : "-", bestDestination ? bestDestination.name : "暂无采集")}
-      ${metric("最近采集", lastSnapshot ? formatDateTime(lastSnapshot.searchedAt) : "-", "模拟数据")}
+      ${metric("最近采集", lastSnapshot ? formatDateTime(lastSnapshot.searchedAt) : "-", lastSnapshot ? lastSnapshotSourceHint(lastSnapshot) : priceSourceHint())}
+      ${metric("价格源", priceSourceLabel(state.settings.priceSourceType), priceSourceHint())}
       ${metric("自动采集", state.settings.autoCollectEnabled ? "已启动" : "未启动", state.settings.lastAutoRunAt ? `上次 ${formatDateTime(state.settings.lastAutoRunAt)}` : `${state.settings.autoCollectIntervalMinutes} 分钟/次`)}
     </section>
+    ${state.collectionMessage ? `<div class="inline-notice">${escapeHtml(state.collectionMessage)}</div>` : ""}
   `;
+}
+
+function renderTopbarPriceSourceBadge() {
+  if (state.settings.priceSourceType !== PRICE_SOURCE_TYPES.AMADEUS) {
+    return `<span class="source-pill source-pill-simulated" title="当前使用本地模拟价格，不会查询真实票价。"><strong>模拟价</strong><small>非真实票价</small></span>`;
+  }
+
+  const amadeus = state.liveSourceStatus?.amadeus;
+  if (amadeus?.ok) {
+    return `<span class="source-pill source-pill-live" title="Amadeus 真实价格源已通过连接验证。"><strong>真实价</strong><small>Amadeus 已验证</small></span>`;
+  }
+
+  if (amadeus?.configured) {
+    return `<span class="source-pill source-pill-pending" title="已检测到 Amadeus 配置，但还没有通过真实连接验证。"><strong>待验证</strong><small>测试真实连接</small></span>`;
+  }
+
+  return `<span class="source-pill source-pill-pending" title="需要在本地服务端配置 Amadeus API Key 和 Secret。"><strong>未配置</strong><small>需要 API Key</small></span>`;
 }
 
 function metric(label, value, hint) {
@@ -711,7 +748,7 @@ function renderTaskDetail() {
         <h2>最近价格快照</h2>
         <span>${filteredSnapshots.length} / ${snapshots.length} 条记录</span>
       </div>
-      ${renderSnapshotFilters(task, filteredSnapshots)}
+      ${renderSnapshotFilters(task, snapshots, filteredSnapshots)}
       ${renderSnapshotTable(filteredSnapshots)}
     </section>
     <section class="detail-panel">
@@ -906,7 +943,7 @@ function renderSnapshotTable(snapshots) {
           <td>${snapshot.airline}</td>
           <td>${minutesToText(snapshot.durationMinutes)}</td>
           <td>${transfer}</td>
-          <td>${snapshot.source || "-"}</td>
+          <td>${renderSnapshotSource(snapshot)}</td>
           <td>${snapshot.includesCheckedBag ? "含" : "不含"}</td>
           <td>
             <div class="price-cell">
@@ -914,7 +951,7 @@ function renderSnapshotTable(snapshots) {
               <span style="width: ${barWidth}%"></span>
             </div>
           </td>
-          <td>${snapshot.bookingUrl ? `<a href="${escapeHtml(snapshot.bookingUrl)}" target="_blank" rel="noreferrer">打开</a>` : "-"}</td>
+          <td>${renderExternalSearchLinks(snapshot)}</td>
         </tr>
       `;
     })
@@ -944,11 +981,64 @@ function renderSnapshotTable(snapshots) {
   `;
 }
 
-function renderSnapshotFilters(task, snapshots) {
+function renderExternalSearchLinks(snapshot) {
+  const task = state.tasks.find((item) => item.id === snapshot.watchTaskId);
+  const destination = destinationById(snapshot.destinationId);
+  const links = buildExternalSearchLinks({ snapshot, task, destination });
+  if (!links.length) return "-";
+  return `
+    <div class="external-link-list">
+      ${links
+        .slice(0, 4)
+        .map((link) => `<a href="${escapeHtml(link.url)}" target="_blank" rel="noreferrer">${escapeHtml(link.label)}</a>`)
+        .join("")}
+    </div>
+  `;
+}
+
+function renderSnapshotSource(snapshot) {
+  const category = snapshotSourceCategory(snapshot);
+  return `
+    <div class="snapshot-source-cell">
+      <strong>${escapeHtml(snapshot.source || "-")}</strong>
+      <span>${escapeHtml(sourceCategoryLabel(category))}</span>
+    </div>
+  `;
+}
+
+function snapshotSourceCategory(snapshot) {
+  if (snapshot?.sourceCategory) return snapshot.sourceCategory;
+  if (snapshot?.sourceType === "live_api") return "live_api";
+  if (snapshot?.sourceType === "mock") return "simulation";
+  if (snapshot?.sourceType === "csv_import") return "csv_import";
+  if (snapshot?.sourceType === "manual") return "manual";
+  if (snapshot?.sourceProvider === "official-airline") return "official_airline";
+  if (["ctrip", "trip.com"].includes(snapshot?.sourceProvider)) return "ota";
+  if (snapshot?.sourceProvider === "google-flights") return "meta_search";
+  if (String(snapshot?.source || "").includes("模拟")) return "simulation";
+  return "unknown";
+}
+
+function sourceCategoryLabel(category) {
+  const labels = {
+    live_api: "真实 API",
+    official_airline: "航司官网",
+    ota: "OTA",
+    meta_search: "元搜索",
+    manual: "手动录入",
+    csv_import: "CSV 导入",
+    simulation: "模拟价",
+    unknown: "未知来源"
+  };
+  return labels[category] || category || "未知来源";
+}
+
+function renderSnapshotFilters(task, snapshots, visibleSnapshots = snapshots) {
   const filters = state.snapshotFilters || defaultState.snapshotFilters;
   const destinations = task.destinationIds.map(destinationById).filter(Boolean);
   const dateOptions = dateOptionsForTask(task);
-  const csvHref = buildSnapshotCsvHref(snapshots);
+  const sourceCategories = Array.from(new Set(snapshots.map(snapshotSourceCategory).filter(Boolean)));
+  const csvHref = buildSnapshotCsvHref(visibleSnapshots);
   return `
     <form class="snapshot-filter-form" data-form="snapshot-filters">
       <label>
@@ -976,6 +1066,13 @@ function renderSnapshotFilters(task, snapshots) {
           }).join("")}
         </select>
       </label>
+      <label>
+        来源类别
+        <select name="sourceCategory">
+          <option value="all" ${filters.sourceCategory === "all" ? "selected" : ""}>全部来源</option>
+          ${sourceCategories.map((category) => `<option value="${escapeHtml(category)}" ${filters.sourceCategory === category ? "selected" : ""}>${escapeHtml(sourceCategoryLabel(category))}</option>`).join("")}
+        </select>
+      </label>
       <div class="snapshot-filter-actions">
         <a class="ghost-button" href="${csvHref}" download="${safeFileName(task.name)}-snapshots.csv">导出 CSV</a>
         <button class="ghost-button" data-action="reset-snapshot-filters" type="button">重置</button>
@@ -991,6 +1088,7 @@ function filteredSnapshotsForTask(task, snapshots) {
     if (filters.destinationId !== "all" && snapshot.destinationId !== filters.destinationId) return false;
     if (filters.strategyType !== "all" && snapshot.strategyType !== filters.strategyType) return false;
     if (filters.datePair !== "all" && `${snapshot.departDate}|${snapshot.returnDate}` !== filters.datePair) return false;
+    if (filters.sourceCategory !== "all" && snapshotSourceCategory(snapshot) !== filters.sourceCategory) return false;
     return snapshot.watchTaskId === task.id;
   });
 }
@@ -1008,6 +1106,9 @@ function renderManualPriceForm(task) {
     task.monitorDirect ? `<option value="direct">直飞</option>` : "",
     task.monitorTransfer ? `<option value="transfer">中转</option>` : ""
   ].join("");
+  const sourceOptions = MANUAL_SOURCE_OPTIONS.map(
+    (option) => `<option value="${escapeHtml(option.sourceProvider)}">${escapeHtml(option.label)}</option>`
+  ).join("");
 
   return `
     <form class="manual-price-form" data-form="manual-price">
@@ -1040,8 +1141,12 @@ function renderManualPriceForm(task) {
         <input name="transferCities" placeholder="例如：首尔, 香港" />
       </label>
       <label>
-        来源
-        <input name="source" placeholder="例如：航司官网 / 携程" />
+        来源类型
+        <select name="sourceProvider">${sourceOptions}</select>
+      </label>
+      <label>
+        来源名称
+        <input name="source" placeholder="例如：东方航空官网 / 携程" />
       </label>
       <label>
         购票链接
@@ -1055,8 +1160,8 @@ function renderManualPriceForm(task) {
     </form>
     <div class="csv-import-panel">
       <h3>批量导入 CSV</h3>
-      <p>表头：destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,bookingUrl,includesCheckedBag</p>
-      <textarea data-field="csv-import" placeholder="destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,bookingUrl,includesCheckedBag">${escapeHtml(state.csvImportText)}</textarea>
+      <p>表头：destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,sourceType,sourceProvider,sourceCategory,bookingUrl,includesCheckedBag</p>
+      <textarea data-field="csv-import" placeholder="destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,sourceType,sourceProvider,sourceCategory,bookingUrl,includesCheckedBag">${escapeHtml(state.csvImportText)}</textarea>
       <div class="backup-actions">
         <button class="ghost-button" data-action="load-csv-example" type="button">填入示例</button>
         <button class="primary-button" data-action="import-price-csv" type="button">导入 CSV</button>
@@ -1333,7 +1438,7 @@ function renderSettings() {
       <article class="detail-panel">
         <p class="eyebrow">Email</p>
         <h2>提醒设置</h2>
-        <p>v1 仍然使用邮件预览，不会自动发送外部邮件；这里的邮箱会用于生成邮件草稿链接。</p>
+        <p>浏览器内仍生成邮件草稿；后台命令行采集可配置 SMTP 自动发送到这里的邮箱。</p>
         <form class="settings-form" data-form="settings">
           <label>
             收件邮箱
@@ -1368,6 +1473,21 @@ function renderSettings() {
           <label>
             自动采集间隔（分钟）
             <input name="autoCollectIntervalMinutes" type="number" min="1" max="1440" value="${state.settings.autoCollectIntervalMinutes}" required />
+          </label>
+          <label>
+            自动价格源
+            <select name="priceSourceType">
+              <option value="${PRICE_SOURCE_TYPES.MOCK}" ${state.settings.priceSourceType === PRICE_SOURCE_TYPES.MOCK ? "selected" : ""}>模拟价格源</option>
+              <option value="${PRICE_SOURCE_TYPES.AMADEUS}" ${state.settings.priceSourceType === PRICE_SOURCE_TYPES.AMADEUS ? "selected" : ""}>Amadeus 真实价格</option>
+            </select>
+          </label>
+          <label>
+            单次真实查询最多报价
+            <input name="livePriceMaxOffersPerSearch" type="number" min="1" max="20" value="${state.settings.livePriceMaxOffersPerSearch}" required />
+          </label>
+          <label>
+            每次采集最多真实查询次数
+            <input name="livePriceMaxQueriesPerRun" type="number" min="1" max="100" value="${state.settings.livePriceMaxQueriesPerRun}" required />
           </label>
           <label class="checkbox">
             <input type="checkbox" name="autoCollectEnabled" ${state.settings.autoCollectEnabled ? "checked" : ""} />
@@ -1416,14 +1536,20 @@ function renderSettings() {
         <p class="eyebrow">Sources</p>
         <h2>价格来源</h2>
         <p>自动采集、手动录入和 CSV 导入现在使用统一价格快照结构；接入真实 API 时只需要新增价格来源适配器。</p>
+        <div class="source-status">
+          ${renderLiveSourceStatus()}
+          <button class="ghost-button" data-action="refresh-price-source-status" type="button">刷新配置</button>
+          <button class="primary-button" data-action="test-live-price-source" type="button">测试真实连接</button>
+        </div>
+        ${renderMonitoringReadiness()}
         <div class="source-list">
-          ${listPriceSources().map(renderPriceSource).join("")}
+          ${listPriceSources(state.liveSourceStatus).map(renderPriceSource).join("")}
         </div>
       </article>
       <article class="detail-panel notification-panel">
         <p class="eyebrow">Notify</p>
         <h2>提醒通道</h2>
-        <p>v1 在浏览器内生成邮件草稿；如果没有默认邮件客户端，可以下载 .eml 文件后再发送或归档。</p>
+        <p>浏览器内可以打开邮件草稿或下载 .eml；后台命令行采集可通过 SMTP 直接发送提醒。</p>
         <div class="source-list">
           ${listNotificationChannels().map(renderNotificationChannel).join("")}
         </div>
@@ -1468,9 +1594,119 @@ function renderPriceSource(source) {
         <strong>${escapeHtml(source.name)}</strong>
         <span>${escapeHtml(source.note)}</span>
       </div>
-      <small>${source.mode === "automatic" ? "自动采集" : "手动导入"} · ${source.status === "enabled" ? "已启用" : "未启用"}</small>
+      <small>${source.mode === "automatic" ? "自动采集" : "手动导入"} · ${priceSourceStatusLabel(source.status)}</small>
     </div>
   `;
+}
+
+function renderLiveSourceStatus() {
+  if (!state.liveSourceStatus) {
+    return `<span>尚未检查真实价格源连接状态。</span>`;
+  }
+  const amadeus = state.liveSourceStatus.amadeus;
+  const statusText = amadeus.ok ? "连接已验证" : amadeus.configured ? "已配置，待验证" : "未配置";
+  const checkedText = amadeus.checkedAt ? ` · ${formatDateTime(amadeus.checkedAt)}` : "";
+  const runtimeText = amadeus.requestTimeoutMs
+    ? ` · 超时 ${Math.round(Number(amadeus.requestTimeoutMs) / 1000)} 秒 · 重试 ${Number(amadeus.retryCount) || 0} 次`
+    : "";
+  const messageText = amadeus.message ? ` · ${escapeHtml(amadeus.message)}` : "";
+  return `<span>Amadeus ${statusText} · ${escapeHtml(amadeus.environment)} · ${escapeHtml(amadeus.baseUrl)}${runtimeText}${checkedText}${messageText}</span>`;
+}
+
+function renderMonitoringReadiness() {
+  const readiness = buildMonitoringReadiness();
+  return `
+    <div class="readiness-panel ${readiness.ready ? "ready" : "needs-action"}">
+      <div>
+        <strong>${readiness.ready ? "真实监控已就绪" : "真实监控未就绪"}</strong>
+        <span>${escapeHtml(readiness.summary)}</span>
+      </div>
+      <ul>
+        ${readiness.items
+          .map(
+            (item) => `
+              <li class="${item.ok ? "ok" : "missing"}">
+                <span>${item.ok ? "✓" : "!"}</span>
+                <div>
+                  <strong>${escapeHtml(item.label)}</strong>
+                  <small>${escapeHtml(item.detail)}</small>
+                </div>
+              </li>
+            `
+          )
+          .join("")}
+      </ul>
+    </div>
+  `;
+}
+
+function buildMonitoringReadiness() {
+  const activeTaskCount = state.tasks.filter((task) => task.status === "active").length;
+  const amadeus = state.liveSourceStatus?.amadeus;
+  const profile = activeProfile();
+  const email = profile?.email || state.settings.email || "";
+  const hasRealEmail = Boolean(email && email !== "your-email@example.com");
+  const items = [
+    {
+      key: "source",
+      required: true,
+      ok: state.settings.priceSourceType === PRICE_SOURCE_TYPES.AMADEUS,
+      label: "真实价格源",
+      detail:
+        state.settings.priceSourceType === PRICE_SOURCE_TYPES.AMADEUS
+          ? "自动采集将使用 Amadeus 真实报价。"
+          : "当前仍是模拟价格源，请在设置中切换到 Amadeus 真实价格。"
+    },
+    {
+      key: "connection",
+      required: true,
+      ok: Boolean(amadeus?.ok),
+      label: "连接验证",
+      detail: amadeus?.ok
+        ? `已验证 ${amadeus.environment} 环境。`
+        : amadeus?.configured
+        ? "已检测到配置，请点击“测试真实连接”。"
+        : "尚未配置 AMADEUS_CLIENT_ID / AMADEUS_CLIENT_SECRET。"
+    },
+    {
+      key: "tasks",
+      required: true,
+      ok: activeTaskCount > 0,
+      label: "启用任务",
+      detail: activeTaskCount > 0 ? `当前有 ${activeTaskCount} 个启用任务。` : "还没有启用的监控任务。"
+    },
+    {
+      key: "email",
+      required: true,
+      ok: hasRealEmail,
+      label: "提醒邮箱",
+      detail: hasRealEmail ? `提醒将发送给 ${email}。` : "请在旅客档案或设置中填写真实收件邮箱。"
+    },
+    {
+      key: "runner",
+      required: false,
+      ok: Boolean(state.settings.autoCollectEnabled),
+      label: "运行方式",
+      detail: state.settings.autoCollectEnabled
+        ? `页面打开期间每 ${state.settings.autoCollectIntervalMinutes} 分钟自动采集。`
+        : "页面自动采集未开启；也可以使用 collect:live 脚本接入系统定时任务。"
+    }
+  ];
+  const requiredReady = items.filter((item) => item.required).every((item) => item.ok);
+  return {
+    ready: requiredReady,
+    items,
+    summary: requiredReady
+      ? "真实报价、任务和提醒配置已满足；请保持页面自动采集开启，或配置浏览器外定时脚本。"
+      : "至少需要真实价格源、连接验证、启用任务和提醒邮箱都通过。"
+  };
+}
+
+function priceSourceStatusLabel(status) {
+  if (status === "enabled") return "已启用";
+  if (status === "needs_verification") return "待验证";
+  if (status === "not_configured") return "未配置";
+  return "计划中";
 }
 
 function renderNotificationChannel(channel) {
@@ -1544,9 +1780,9 @@ function bindEvents() {
   });
 
   document.querySelectorAll("[data-action='create-from-preset']").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       const taskId = createTaskFromPreset(button.dataset.presetId);
-      simulateTask(taskId);
+      await collectTaskPrices(taskId);
       state.activeView = "tasks";
       render();
     });
@@ -1611,8 +1847,8 @@ function bindEvents() {
   });
 
   document.querySelectorAll("[data-action='simulate-task']").forEach((button) => {
-    button.addEventListener("click", () => {
-      simulateTask(button.dataset.taskId);
+    button.addEventListener("click", async () => {
+      await collectTaskPrices(button.dataset.taskId);
       render();
     });
   });
@@ -1626,17 +1862,17 @@ function bindEvents() {
   });
 
   document.querySelectorAll("[data-action='simulate-all']").forEach((button) => {
-    button.addEventListener("click", () => {
-      collectAllActiveTasks();
+    button.addEventListener("click", async () => {
+      await collectAllActiveTasks();
       render();
     });
   });
 
   document.querySelectorAll("[data-action='toggle-auto']").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       state.settings.autoCollectEnabled = !state.settings.autoCollectEnabled;
       if (state.settings.autoCollectEnabled) {
-        collectAllActiveTasks(true);
+        await collectAllActiveTasks(true);
       }
       saveState();
       syncAutoCollector();
@@ -1697,11 +1933,11 @@ function bindEvents() {
     }, 0);
   });
 
-  document.querySelector("[data-form='manual-task']")?.addEventListener("submit", (event) => {
+  document.querySelector("[data-form='manual-task']")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const formData = new FormData(event.currentTarget);
     const taskId = createManualTask(formData);
-    simulateTask(taskId);
+    await collectTaskPrices(taskId);
     state.activeView = "tasks";
     render();
   });
@@ -1725,6 +1961,9 @@ function bindEvents() {
       alertAverageDropPercent: clampNumber(Number(formData.get("alertAverageDropPercent")), 1, 80),
       autoCollectEnabled: formData.get("autoCollectEnabled") === "on",
       autoCollectIntervalMinutes: clampNumber(Number(formData.get("autoCollectIntervalMinutes")), 1, 1440),
+      priceSourceType: String(formData.get("priceSourceType") || PRICE_SOURCE_TYPES.MOCK),
+      livePriceMaxOffersPerSearch: clampNumber(Number(formData.get("livePriceMaxOffersPerSearch")), 1, 20),
+      livePriceMaxQueriesPerRun: clampNumber(Number(formData.get("livePriceMaxQueriesPerRun")), 1, 100),
       autoPruneSnapshots: formData.get("autoPruneSnapshots") === "on",
       maxSnapshotsPerTask: clampNumber(Number(formData.get("maxSnapshotsPerTask")), 50, 5000),
       lastAutoRunAt: state.settings.lastAutoRunAt
@@ -1767,6 +2006,20 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector("[data-action='refresh-price-source-status']")?.addEventListener("click", async () => {
+    await refreshLivePriceSourceStatus();
+    render();
+  });
+
+  document.querySelector("[data-action='test-live-price-source']")?.addEventListener("click", async () => {
+    state.collectionMessage = "正在测试 Amadeus 真实价格源连接...";
+    render();
+    await refreshLivePriceSourceStatus(true);
+    const amadeus = state.liveSourceStatus?.amadeus;
+    state.collectionMessage = amadeus?.ok ? "Amadeus 真实价格源连接验证成功。" : `Amadeus 连接验证失败：${amadeus?.message || "未知错误"}`;
+    render();
+  });
+
   document.querySelector("[data-action='export-backup']")?.addEventListener("click", () => {
     state.backupText = serializeBackup(state);
     state.backupMessage = "已生成导出 JSON。";
@@ -1804,8 +2057,8 @@ function bindEvents() {
     const destination = task?.destinationIds.map(destinationById).filter(Boolean)[0];
     const dateOption = task ? dateOptionsForTask(task)[0] : null;
     state.csvImportText = [
-      "destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,bookingUrl,includesCheckedBag",
-      `${destination?.name || "目的地"},${dateOption?.departDate || "2027-01-01"},${dateOption?.returnDate || "2027-01-05"},direct,1680,示例航空,280,,航司官网,https://example.com,true`
+      "destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,sourceType,sourceProvider,sourceCategory,bookingUrl,includesCheckedBag",
+      `${destination?.name || "目的地"},${dateOption?.departDate || "2027-01-01"},${dateOption?.returnDate || "2027-01-05"},direct,1680,示例航空,280,,航司官网,csv_import,official-airline,official_airline,https://example.com,true`
     ].join("\n");
     state.csvImportMessage = "已填入示例 CSV。";
     render();
@@ -1892,19 +2145,35 @@ function applyTaskFilters(formData) {
 }
 
 function alertRulesFromSettings() {
-  return {
-    budgetEnabled: Boolean(state.settings.alertBudgetEnabled),
-    historicalLowEnabled: Boolean(state.settings.alertHistoricalLowEnabled),
-    averageDropEnabled: Boolean(state.settings.alertAverageDropEnabled),
-    averageDropPercent: clampNumber(Number(state.settings.alertAverageDropPercent), 1, 80)
-  };
+  return buildAlertRulesFromSettings(state.settings);
+}
+
+async function refreshLivePriceSourceStatus(deep = false) {
+  state.liveSourceStatus = await getLivePriceSourceStatus({ deep });
+  return state.liveSourceStatus;
+}
+
+async function ensureLivePriceSourceReady() {
+  if (state.settings.priceSourceType !== PRICE_SOURCE_TYPES.AMADEUS) return true;
+  if (state.liveSourceStatus?.amadeus?.ok) return true;
+
+  state.collectionMessage = "正在验证 Amadeus 真实价格源连接...";
+  const status = await refreshLivePriceSourceStatus(true);
+  const amadeus = status?.amadeus;
+  if (amadeus?.ok) return true;
+
+  state.collectionMessage = status
+    ? `Amadeus 真实价格源不可用：${amadeus?.message || "未知错误"}`
+    : "真实价格 API 不可用。请使用 `node scripts/serve.mjs` 启动本地服务，而不是仅启动静态预览。";
+  return false;
 }
 
 function applySnapshotFilters(formData) {
   state.snapshotFilters = {
     destinationId: String(formData.get("destinationId") || "all"),
     strategyType: String(formData.get("strategyType") || "all"),
-    datePair: String(formData.get("datePair") || "all")
+    datePair: String(formData.get("datePair") || "all"),
+    sourceCategory: String(formData.get("sourceCategory") || "all")
   };
 }
 
@@ -2046,16 +2315,48 @@ function resolveManualHolidayId(formData) {
   return holiday.id;
 }
 
-function simulateTask(taskId) {
+async function collectTaskPrices(taskId) {
   const task = state.tasks.find((item) => item.id === taskId);
   if (!task || task.status !== "active") return;
+  if (!(await ensureLivePriceSourceReady())) {
+    task.updatedAt = new Date().toISOString();
+    saveState();
+    return;
+  }
 
-  const snapshots = collectPriceSnapshots({
-    task,
-    destinations: task.destinationIds.map(destinationById).filter(Boolean),
-    dateOptions: dateOptionsForTask(task),
-    sourceType: PRICE_SOURCE_TYPES.MOCK
-  });
+  const destinations = task.destinationIds.map(destinationById).filter(Boolean);
+  const dateOptions = dateOptionsForTask(task);
+  let snapshots = [];
+
+  try {
+    if (state.settings.priceSourceType === PRICE_SOURCE_TYPES.AMADEUS) {
+      const result = await collectLivePriceSnapshots({
+        task,
+        destinations,
+        dateOptions,
+        maxOffersPerSearch: state.settings.livePriceMaxOffersPerSearch,
+        maxQueriesPerRun: state.settings.livePriceMaxQueriesPerRun
+      });
+      snapshots = result.snapshots || [];
+      const queryStatsText = `执行 ${result.executedSearches || 0}/${result.estimatedSearches || 0} 次真实查询，缓存命中 ${result.cacheHits || 0} 次。`;
+      state.collectionMessage = snapshots.length
+        ? `Amadeus 已采集 ${snapshots.length} 条真实价格快照，${queryStatsText}${result.skippedSearches ? `跳过 ${result.skippedSearches} 次。` : ""}${result.warnings?.length ? `有 ${result.warnings.length} 条查询警告。` : ""}`
+        : `Amadeus 未返回可用报价，${queryStatsText}${result.skippedSearches ? `跳过 ${result.skippedSearches} 次。` : ""}${result.warnings?.length ? result.warnings.slice(0, 2).join("；") : ""}`;
+    } else {
+      snapshots = collectPriceSnapshots({
+        task,
+        destinations,
+        dateOptions,
+        sourceType: PRICE_SOURCE_TYPES.MOCK
+      });
+      state.collectionMessage = `模拟价格源已生成 ${snapshots.length} 条价格快照。`;
+    }
+  } catch (error) {
+    state.collectionMessage = `真实价格采集失败：${error.message}`;
+    task.updatedAt = new Date().toISOString();
+    saveState();
+    return;
+  }
 
   snapshots.forEach((snapshot) => {
     const evaluation = evaluateAlert({
@@ -2081,6 +2382,8 @@ function addManualPriceSnapshot(formData) {
   if (!destination) return;
 
   const [departDate, returnDate] = String(formData.get("datePair")).split("|");
+  const sourceOption = manualSourceOptionByProvider(String(formData.get("sourceProvider") || ""));
+  const sourceName = String(formData.get("source") || "").trim() || sourceOption.source;
   const snapshot = buildManualPriceSnapshot({
     task,
     destination,
@@ -2093,7 +2396,9 @@ function addManualPriceSnapshot(formData) {
     priceCurrency: task.budgetCurrency,
     transferCities: String(formData.get("transferCities") || ""),
     includesCheckedBag: formData.get("includesCheckedBag") === "on",
-    source: String(formData.get("source") || ""),
+    source: sourceName,
+    sourceProvider: sourceOption.sourceProvider,
+    sourceCategory: sourceOption.sourceCategory,
     bookingUrl: String(formData.get("bookingUrl") || "")
   });
   if (!Number.isFinite(snapshot.priceAmount) || snapshot.priceAmount <= 0) return;
@@ -2135,6 +2440,9 @@ function addManualPriceSnapshotsFromCsv(text) {
       transferCities: row.transferCities,
       includesCheckedBag: parseBoolean(row.includesCheckedBag),
       source: row.source,
+      sourceType: row.sourceType || "csv_import",
+      sourceProvider: row.sourceProvider || row.source || "csv",
+      sourceCategory: row.sourceCategory || "csv_import",
       bookingUrl: row.bookingUrl
     });
     if (!Number.isFinite(snapshot.priceAmount) || snapshot.priceAmount <= 0) return;
@@ -2168,9 +2476,25 @@ function parseBoolean(value) {
   return ["true", "1", "yes", "y", "是", "含"].includes(String(value || "").trim().toLowerCase());
 }
 
-function collectAllActiveTasks(markAsAuto = false) {
+async function collectAllActiveTasks(markAsAuto = false) {
   const activeTasks = state.tasks.filter((task) => task.status === "active");
-  activeTasks.forEach((task) => simulateTask(task.id));
+  if (!activeTasks.length) {
+    if (markAsAuto) {
+      state.settings.lastAutoRunAt = new Date().toISOString();
+      saveState();
+    }
+    return;
+  }
+  if (!(await ensureLivePriceSourceReady())) {
+    if (markAsAuto) {
+      state.settings.lastAutoRunAt = new Date().toISOString();
+      saveState();
+    }
+    return;
+  }
+  for (const task of activeTasks) {
+    await collectTaskPrices(task.id);
+  }
   if (markAsAuto) {
     state.settings.lastAutoRunAt = new Date().toISOString();
     saveState();
@@ -2186,8 +2510,8 @@ function syncAutoCollector() {
   if (!state.settings.autoCollectEnabled) return;
 
   const intervalMinutes = clampNumber(Number(state.settings.autoCollectIntervalMinutes), 1, 1440);
-  autoCollectTimer = window.setInterval(() => {
-    collectAllActiveTasks(true);
+  autoCollectTimer = window.setInterval(async () => {
+    await collectAllActiveTasks(true);
     render();
   }, intervalMinutes * 60 * 1000);
 }
@@ -2222,41 +2546,28 @@ function buildCustomDestinationFromForm(formData, name) {
 
 function createAlertLog(task, snapshot, evaluation) {
   const destination = destinationById(snapshot.destinationId);
-  const strategy = snapshot.strategyType === "direct" ? "直飞" : "中转";
   const profile = profileForTask(task);
-  return {
-    id: `alert-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    watchTaskId: task.id,
-    flightPriceSnapshotId: snapshot.id,
-    alertRuleId: "default-low-price",
+  return buildAlertLog({
+    task,
+    snapshot,
+    evaluation,
+    destination,
     recipientEmail: profile.email || state.settings.email,
-    subject: `[机票提醒] ${task.name} ${destination.name} ${strategy} ${formatMoney(snapshot.priceAmount, snapshot.priceCurrency)}`,
-    triggerReason: evaluation.reasons.join("，"),
-    historicalLow: evaluation.historicalLow,
-    average30: evaluation.average30,
-    cooldownHours: Number(state.settings.cooldownHours) || defaultSettings.cooldownHours,
-    sentAt: new Date().toISOString(),
-    sendStatus: "preview"
-  };
+    cooldownHours: Number(state.settings.cooldownHours) || defaultSettings.cooldownHours
+  });
 }
 
 function canSendAlert(taskId, destinationId, strategyType, departDate, returnDate) {
-  const cooldownMs = (Number(state.settings.cooldownHours) || defaultSettings.cooldownHours) * 60 * 60 * 1000;
-  const latest = state.alerts
-    .map((alert) => ({
-      alert,
-      snapshot: state.snapshots.find((snapshot) => snapshot.id === alert.flightPriceSnapshotId)
-    }))
-    .filter(
-      ({ alert, snapshot }) =>
-        alert.watchTaskId === taskId &&
-        snapshot?.destinationId === destinationId &&
-        snapshot?.strategyType === strategyType &&
-        snapshot?.departDate === departDate &&
-        snapshot?.returnDate === returnDate
-    )
-    .sort((a, b) => new Date(b.alert.sentAt) - new Date(a.alert.sentAt))[0];
-  return !latest || Date.now() - new Date(latest.alert.sentAt).getTime() > cooldownMs;
+  return canSendAlertForSeries({
+    alerts: state.alerts,
+    snapshots: state.snapshots,
+    settings: state.settings,
+    taskId,
+    destinationId,
+    strategyType,
+    departDate,
+    returnDate
+  });
 }
 
 function bestSnapshotForTask(taskId) {
@@ -2390,6 +2701,22 @@ function clampNumber(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function priceSourceLabel(sourceType) {
+  if (sourceType === PRICE_SOURCE_TYPES.AMADEUS) return "Amadeus";
+  return "模拟";
+}
+
+function priceSourceHint() {
+  if (state.settings.priceSourceType !== PRICE_SOURCE_TYPES.AMADEUS) return "当前不会查询真实票价";
+  if (state.liveSourceStatus?.amadeus?.ok) return "真实 API 已验证";
+  if (state.liveSourceStatus?.amadeus?.configured) return "真实 API 待验证";
+  return "真实 API 未配置";
+}
+
+function lastSnapshotSourceHint(snapshot) {
+  return `${sourceCategoryLabel(snapshotSourceCategory(snapshot))} · ${snapshot.sourceProvider || snapshot.source || "未知来源"}`;
+}
+
 function totalPrice(singlePrice, task) {
   return singlePrice * (Number(task.passengerCount) || 1);
 }
@@ -2432,7 +2759,15 @@ function buildSnapshotCsvHref(snapshots) {
         includesTax: snapshot.includesTax ? "true" : "false",
         includesCheckedBag: snapshot.includesCheckedBag ? "true" : "false",
         source: snapshot.source,
-        bookingUrl: snapshot.bookingUrl
+        sourceType: snapshot.sourceType || "",
+        sourceProvider: snapshot.sourceProvider || "",
+        sourceCategory: snapshot.sourceCategory || "",
+        sourceVerifiedAt: snapshot.sourceVerifiedAt || "",
+        rawProviderOfferId: snapshot.rawProviderOfferId || "",
+        bookingUrl: snapshot.bookingUrl,
+        externalSearchLinks: buildExternalSearchLinks({ snapshot, task: state.tasks.find((item) => item.id === snapshot.watchTaskId), destination })
+          .map((link) => `${link.label}:${link.url}`)
+          .join(" | ")
       };
     });
   const csv = serializeCsv(rows, [
@@ -2453,7 +2788,13 @@ function buildSnapshotCsvHref(snapshots) {
     { key: "includesTax", label: "includesTax" },
     { key: "includesCheckedBag", label: "includesCheckedBag" },
     { key: "source", label: "source" },
-    { key: "bookingUrl", label: "bookingUrl" }
+    { key: "sourceType", label: "sourceType" },
+    { key: "sourceProvider", label: "sourceProvider" },
+    { key: "sourceCategory", label: "sourceCategory" },
+    { key: "sourceVerifiedAt", label: "sourceVerifiedAt" },
+    { key: "rawProviderOfferId", label: "rawProviderOfferId" },
+    { key: "bookingUrl", label: "bookingUrl" },
+    { key: "externalSearchLinks", label: "externalSearchLinks" }
   ]);
   return `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`;
 }
@@ -2476,3 +2817,4 @@ function escapeHtml(value) {
 
 render();
 syncAutoCollector();
+refreshLivePriceSourceStatus().then(() => render());

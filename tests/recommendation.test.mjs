@@ -10,7 +10,19 @@ import {
 } from "../src/domain.js";
 import { parseBackup, pruneSnapshotsByTask, removeTaskData, serializeBackup, serializeCsv } from "../src/storage.js";
 import { collectPriceSnapshots, listPriceSources, PRICE_SOURCE_TYPES } from "../src/priceSources.js";
+import {
+  buildAmadeusFlightOfferCacheKey,
+  checkAmadeusHealth,
+  estimateAmadeusSearchCount,
+  getAmadeusConfig,
+  resetAmadeusFlightOfferCache,
+  resetAmadeusTokenCache,
+  transformAmadeusOfferToSnapshot
+} from "../scripts/amadeusFlightSource.mjs";
+import { buildSmtpMessage, checkSmtpHealth, getSmtpConfig, publicSmtpStatus } from "../scripts/smtpMailer.mjs";
 import { buildEmailDraft, buildEmlContent, buildMailtoLink, listNotificationChannels, NOTIFICATION_CHANNELS } from "../src/notifications.js";
+import { buildExternalSearchLinks } from "../src/externalSearchLinks.js";
+import { MANUAL_SOURCE_OPTIONS, manualSourceOptionByProvider, SOURCE_CATEGORIES } from "../src/priceSourceCatalog.js";
 import {
   buildRecommendationScore,
   createPriceSnapshot,
@@ -62,6 +74,9 @@ const snapshot = createPriceSnapshot({
 });
 assert.equal(snapshot.strategyType, "transfer");
 assert.equal(snapshot.transferCount, 1);
+assert.equal(snapshot.sourceType, "mock");
+assert.equal(snapshot.sourceProvider, "local-simulator");
+assert.equal(snapshot.sourceCategory, "simulation");
 assert.ok(snapshot.priceAmount > 0, "snapshot should have a positive price");
 
 const sourceSnapshots = collectPriceSnapshots({
@@ -77,6 +92,150 @@ const sourceSnapshots = collectPriceSnapshots({
 assert.equal(sourceSnapshots.length, 4);
 assert.deepEqual(new Set(sourceSnapshots.map((item) => item.strategyType)), new Set(["direct", "transfer"]));
 assert.ok(listPriceSources().some((source) => source.id === PRICE_SOURCE_TYPES.MOCK), "should expose mock price source");
+assert.equal(
+  listPriceSources({ amadeus: { configured: true, environment: "test", baseUrl: "https://test.api.amadeus.com" } })
+    .find((source) => source.id === PRICE_SOURCE_TYPES.AMADEUS)
+    .status,
+  "needs_verification"
+);
+assert.equal(
+  listPriceSources({ amadeus: { configured: true, ok: true, environment: "test", baseUrl: "https://test.api.amadeus.com" } })
+    .find((source) => source.id === PRICE_SOURCE_TYPES.AMADEUS)
+    .status,
+  "enabled"
+);
+assert.ok(MANUAL_SOURCE_OPTIONS.some((option) => option.sourceCategory === SOURCE_CATEGORIES.OFFICIAL_AIRLINE));
+assert.equal(manualSourceOptionByProvider("ctrip").sourceCategory, SOURCE_CATEGORIES.OTA);
+assert.equal(manualSourceOptionByProvider("trip.com").sourceCategory, SOURCE_CATEGORIES.OTA);
+
+const missingAmadeusHealth = await checkAmadeusHealth({});
+assert.equal(missingAmadeusHealth.configured, false);
+assert.equal(missingAmadeusHealth.ok, false);
+assert.equal(missingAmadeusHealth.requestTimeoutMs, 20000);
+assert.equal(missingAmadeusHealth.retryCount, 1);
+assert.ok(missingAmadeusHealth.message.includes("未配置"));
+const amadeusRuntimeConfig = getAmadeusConfig({
+  AMADEUS_CLIENT_ID: "id",
+  AMADEUS_CLIENT_SECRET: "secret",
+  AMADEUS_REQUEST_TIMEOUT_MS: "500",
+  AMADEUS_RETRY_COUNT: "9"
+});
+assert.equal(amadeusRuntimeConfig.configured, true);
+assert.equal(amadeusRuntimeConfig.requestTimeoutMs, 1000);
+assert.equal(amadeusRuntimeConfig.retryCount, 3);
+resetAmadeusTokenCache();
+resetAmadeusFlightOfferCache();
+
+const amadeusConfig = { baseUrl: "https://test.api.amadeus.com" };
+const directCacheKey = buildAmadeusFlightOfferCacheKey({
+  config: amadeusConfig,
+  originAirport: "PVG",
+  destinationAirport: "KIX",
+  departureDate: "2026-10-01",
+  returnDate: "2026-10-07",
+  adults: 1,
+  currencyCode: "CNY",
+  nonStop: true,
+  max: 8
+});
+const transferCacheKey = buildAmadeusFlightOfferCacheKey({
+  config: amadeusConfig,
+  originAirport: "PVG",
+  destinationAirport: "KIX",
+  departureDate: "2026-10-01",
+  returnDate: "2026-10-07",
+  adults: 1,
+  currencyCode: "CNY",
+  nonStop: false,
+  max: 8
+});
+assert.equal(
+  directCacheKey,
+  buildAmadeusFlightOfferCacheKey({
+    config: amadeusConfig,
+    originAirport: "PVG",
+    destinationAirport: "KIX",
+    departureDate: "2026-10-01",
+    returnDate: "2026-10-07",
+    adults: 1,
+    currencyCode: "CNY",
+    nonStop: true,
+    max: 8
+  })
+);
+assert.notEqual(directCacheKey, transferCacheKey);
+
+assert.equal(
+  estimateAmadeusSearchCount({
+    task: { ...task, originAirportCodes: ["PVG", "SHA"], monitorDirect: true, monitorTransfer: true },
+    destinations: [{ ...destination, airportCodes: ["KIX", "ITM"] }],
+    dateOptions: [
+      { departDate: "2026-10-01", returnDate: "2026-10-07" },
+      { departDate: "2026-10-02", returnDate: "2026-10-08" }
+    ]
+  }),
+  16
+);
+
+const amadeusSnapshot = transformAmadeusOfferToSnapshot({
+  offer: {
+    id: "1",
+    itineraries: [
+      {
+        duration: "PT5H30M",
+        segments: [
+          {
+            departure: { iataCode: "PVG" },
+            arrival: { iataCode: "ICN" },
+            carrierCode: "MU",
+            number: "501",
+            duration: "PT2H"
+          },
+          {
+            departure: { iataCode: "ICN" },
+            arrival: { iataCode: "KIX" },
+            carrierCode: "OZ",
+            number: "112",
+            duration: "PT1H50M"
+          }
+        ]
+      },
+      {
+        duration: "PT4H45M",
+        segments: [
+          {
+            departure: { iataCode: "KIX" },
+            arrival: { iataCode: "PVG" },
+            carrierCode: "MU",
+            number: "730",
+            duration: "PT2H45M"
+          }
+        ]
+      }
+    ],
+    price: { currency: "CNY", total: "1680.20", grandTotal: "1710.20" },
+    travelerPricings: [{ fareDetailsBySegment: [{ includedCheckedBags: { quantity: 1 } }] }]
+  },
+  task,
+  destination,
+  strategyType: "transfer",
+  originAirport: "PVG",
+  destinationAirport: "KIX",
+  dateOption: { departDate: "2026-10-01", returnDate: "2026-10-07" },
+  searchedAt: new Date("2026-07-03T00:00:00Z")
+});
+assert.equal(amadeusSnapshot.source, "Amadeus Flight Offers Search");
+assert.equal(amadeusSnapshot.sourceType, "live_api");
+assert.equal(amadeusSnapshot.sourceProvider, "amadeus");
+assert.equal(amadeusSnapshot.sourceCategory, "live_api");
+assert.equal(amadeusSnapshot.sourceVerifiedAt, "2026-07-03T00:00:00.000Z");
+assert.equal(amadeusSnapshot.priceAmount, 1710);
+assert.equal(amadeusSnapshot.transferCount, 1);
+assert.deepEqual(amadeusSnapshot.transferCities, ["ICN"]);
+assert.ok(amadeusSnapshot.bookingUrl.startsWith("https://www.google.com/travel/flights"));
+const externalLinks = buildExternalSearchLinks({ snapshot: amadeusSnapshot, task, destination });
+assert.ok(externalLinks.some((link) => link.id === "ctrip"));
+assert.ok(externalLinks.some((link) => link.id === "airline"));
 
 const alert = evaluateAlert({ task, snapshot, history: [] });
 assert.equal(alert.shouldAlert, true);
@@ -217,6 +376,9 @@ const manualSnapshot = buildManualPriceSnapshot({
   searchedAt: new Date("2026-07-03T00:00:00Z")
 });
 assert.equal(manualSnapshot.priceAmount, 1680);
+assert.equal(manualSnapshot.sourceType, "manual");
+assert.equal(manualSnapshot.sourceProvider, "manual-entry");
+assert.equal(manualSnapshot.sourceCategory, "manual");
 assert.equal(manualSnapshot.transferCount, 2);
 const csvRows = parseCsvRows([
   "destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,bookingUrl,includesCheckedBag",
@@ -226,6 +388,13 @@ const csvRows = parseCsvRows([
 assert.equal(csvRows.length, 2);
 assert.equal(csvRows[0].transferCities, "Seoul, Hong Kong");
 assert.equal(csvRows[1].bookingUrl, "");
+const enrichedCsvRows = parseCsvRows([
+  "destination,departDate,returnDate,strategyType,priceAmount,airline,durationMinutes,transferCities,source,sourceType,sourceProvider,sourceCategory,bookingUrl,includesCheckedBag",
+  "osaka-kyoto,2027-02-10,2027-02-15,direct,2100,Demo Air,180,,Ctrip,csv_import,ctrip,ota,https://example.com,false"
+].join("\n"));
+assert.equal(enrichedCsvRows[0].sourceType, "csv_import");
+assert.equal(enrichedCsvRows[0].sourceProvider, "ctrip");
+assert.equal(enrichedCsvRows[0].sourceCategory, "ota");
 assert.deepEqual(manualSnapshot.transferCities, ["首尔", "香港"]);
 assert.equal(manualSnapshot.includesCheckedBag, true);
 assert.equal(manualSnapshot.source, "航司官网");
@@ -246,11 +415,41 @@ assert.equal(emailDraft.to, "traveler@example.com");
 assert.ok(emailDraft.body.includes("国庆测试"));
 assert.ok(emailDraft.body.includes("航线：上海 (PVG / SHA) -> 大阪 / 京都"));
 assert.ok(emailDraft.body.includes("中转：首尔 / 香港，2 次中转"));
+assert.ok(emailDraft.body.includes("价格说明：该价格来自监控数据源"));
+assert.ok(emailDraft.body.includes("来源类别：manual"));
+assert.ok(emailDraft.body.includes("外部查询："));
 assert.ok(buildMailtoLink(emailDraft).startsWith("mailto:traveler%40example.com"));
 const emlContent = buildEmlContent(emailDraft, new Date("2026-07-03T00:00:00Z"));
 assert.ok(emlContent.includes("Content-Type: text/plain; charset=utf-8"));
 assert.ok(emlContent.includes("Subject: [机票提醒] 测试"));
 assert.ok(listNotificationChannels().some((channel) => channel.id === NOTIFICATION_CHANNELS.EML));
+assert.equal(listNotificationChannels().find((channel) => channel.id === NOTIFICATION_CHANNELS.SMTP).status, "enabled");
+const smtpConfig = getSmtpConfig({
+  SMTP_HOST: "smtp.example.com",
+  SMTP_PORT: "999999",
+  SMTP_SECURE: "true",
+  SMTP_USER: "alerts@example.com",
+  SMTP_PASS: "secret",
+  SMTP_FROM: "Flight Alerts <alerts@example.com>\r\nBCC: leak@example.com",
+  SMTP_TIMEOUT_MS: "500"
+});
+assert.equal(smtpConfig.configured, true);
+assert.equal(smtpConfig.port, 65535);
+assert.equal(smtpConfig.secure, true);
+assert.equal(smtpConfig.fromAddress, "alerts@example.com");
+assert.equal(smtpConfig.timeoutMs, 1000);
+const smtpStatus = publicSmtpStatus(smtpConfig);
+assert.equal(smtpStatus.authConfigured, true);
+assert.equal("password" in smtpStatus, false);
+assert.equal(smtpStatus.fromAddress, "alerts@example.com");
+const smtpMessage = buildSmtpMessage(emailDraft, smtpConfig, new Date("2026-07-03T00:00:00Z"));
+assert.ok(smtpMessage.includes("From: Flight Alerts <alerts@example.com> BCC: leak@example.com"));
+assert.ok(smtpMessage.includes("To: traveler@example.com"));
+assert.ok(smtpMessage.includes("Content-Type: text/plain; charset=utf-8"));
+const missingSmtpHealth = await checkSmtpHealth({});
+assert.equal(missingSmtpHealth.configured, false);
+assert.equal(missingSmtpHealth.ok, false);
+assert.ok(missingSmtpHealth.message.includes("SMTP 未配置"));
 
 const alternateOriginDraft = buildEmailDraft({
   alert: {
@@ -302,6 +501,7 @@ assert.equal(restored.settings.cooldownHours, 12);
 assert.equal(restored.profiles[0].originCity, "上海");
 assert.equal(restored.activeProfileId, "local-user");
 assert.equal(restored.customHolidays[0].name, "公司年假");
+assert.equal(parseBackup(`\uFEFF${backupText}`, { email: "default@example.com" }).tasks.length, 1);
 
 const removed = removeTaskData(
   {

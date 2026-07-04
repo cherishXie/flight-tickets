@@ -1,4 +1,5 @@
 import { formatMoney } from "./pricing.js";
+import { buildExternalSearchLinks } from "./externalSearchLinks.js";
 
 export const NOTIFICATION_CHANNELS = {
   MAILTO: "mailto",
@@ -23,8 +24,8 @@ export function listNotificationChannels() {
     {
       id: NOTIFICATION_CHANNELS.SMTP,
       name: "SMTP / 第三方邮件 API",
-      status: "planned",
-      note: "后续迁移到后端服务后接入，用于真正自动发送邮件。"
+      status: "enabled",
+      note: "后台命令行采集可通过 SMTP 自动发送；浏览器内仍生成草稿。"
     }
   ];
 }
@@ -38,6 +39,9 @@ export function buildEmailDraft({ alert, task, snapshot, destination }) {
   const transferText = snapshot?.strategyType === "transfer"
     ? `${snapshot.transferCities?.length ? snapshot.transferCities.join(" / ") : "待确认"}，${Number(snapshot.transferCount) || 1} 次中转`
     : "无中转";
+  const externalLinks = buildExternalSearchLinks({ snapshot, task, destination });
+  const bookingText = snapshot?.bookingUrl || externalLinks[0]?.url || "";
+  const externalLinkText = externalLinks.map((link) => `${link.label}：${link.url}`).join("\n");
   return {
     to: alert.recipientEmail,
     subject: alert.subject,
@@ -57,7 +61,11 @@ export function buildEmailDraft({ alert, task, snapshot, destination }) {
       `中转：${transferText}`,
       `行李：${snapshot?.includesCheckedBag ? "含托运行李" : "未含托运行李"}`,
       `来源：${snapshot?.source || ""}`,
-      `购票链接：${snapshot?.bookingUrl || ""}`
+      `来源类型：${snapshot?.sourceType || ""}${snapshot?.sourceProvider ? ` / ${snapshot.sourceProvider}` : ""}`,
+      `来源类别：${snapshot?.sourceCategory || ""}`,
+      `购票链接：${bookingText}`,
+      `价格说明：该价格来自监控数据源，购买前请通过外部查询入口复核票价、税费、行李和退改规则。`,
+      externalLinkText ? `外部查询：\n${externalLinkText}` : ""
     ].join("\n")
   };
 }

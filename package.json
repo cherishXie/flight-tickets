@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "serve": "node scripts/serve.mjs",
+    "check:live": "node scripts/checkLiveReadiness.mjs",
+    "collect:live": "node scripts/collectLiveOnce.mjs",
+    "smoke:live": "node scripts/smokeLivePriceSource.mjs",
     "test": "node tests/recommendation.test.mjs"
   }
 }

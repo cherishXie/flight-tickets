@@ -93,6 +93,9 @@ export function buildManualPriceSnapshot({
   transferCities,
   includesCheckedBag,
   source,
+  sourceType = "manual",
+  sourceProvider = "manual-entry",
+  sourceCategory = "manual",
   bookingUrl,
   searchedAt = new Date()
 }) {
@@ -116,6 +119,9 @@ export function buildManualPriceSnapshot({
     includesTax: true,
     includesCheckedBag: Boolean(includesCheckedBag),
     source: source || "手动录入",
+    sourceType,
+    sourceProvider,
+    sourceCategory,
     bookingUrl: bookingUrl || "",
     searchedAt: searchedAt.toISOString()
   };

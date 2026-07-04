@@ -29,7 +29,7 @@ export function serializeCsv(rows, headers) {
 }
 
 export function parseBackup(text, defaultSettings) {
-  const parsed = JSON.parse(text);
+  const parsed = JSON.parse(String(text || "").replace(/^\uFEFF/, ""));
   const data = parsed && parsed.data ? parsed.data : parsed;
 
   return {

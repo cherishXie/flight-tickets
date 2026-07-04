@@ -57,6 +57,9 @@ export function createPriceSnapshot({ task, destination, strategyType, searchedA
     includesTax: true,
     includesCheckedBag: priceAmount >= base * 0.9,
     source: "模拟价格源",
+    sourceType: "mock",
+    sourceProvider: "local-simulator",
+    sourceCategory: "simulation",
     bookingUrl: "",
     searchedAt: searchedAt.toISOString()
   };
